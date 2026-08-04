@@ -1,21 +1,25 @@
-"""Configure Meshtastic's MAVLink serial bridge with older generated Python bindings.
+"""Configure Meshtastic's frame-aware MAVLink mesh mode.
 
-The canonical schema adds Serial_Mode.MAVLINK = 11 and SerialConfig.peer_node = 9.
-Proto3 preserves unknown fields, so this helper can configure both values without
-forcing an unrelated wholesale refresh of every generated Python protobuf file.
+The generated Python bindings on this branch predate the canonical
+Serial_Mode.MAVLINK enum value 11. Proto3 preserves open enum values, so this
+helper can configure the mode without regenerating every protobuf binding.
+
+serial.peer_node is a legacy field from the point-to-point prototype. Current
+firmware ignores it because MAVLink mesh routing is symmetric and any-to-any.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
+import warnings
 from typing import Iterator, Optional, Tuple
 
 from meshtastic.protobuf import module_config_pb2
 
 MAVLINK_SERIAL_MODE = 11
-PEER_NODE_FIELD = 9
 MODE_FIELD = 7
+LEGACY_PEER_NODE_FIELD = 9
 
 
 def _encode_varint(value: int) -> bytes:
@@ -78,30 +82,37 @@ def _merge_varint_field(message, field_number: int, value: int) -> None:
 
 
 def read_peer_node(serial_config) -> int:
-    """Return the last encoded peer_node value, or zero when not present."""
+    """Read a legacy encoded peer_node value, if present.
+
+    Current frame-aware mesh firmware ignores this field. The reader remains for
+    inspection and backwards compatibility with old configurations.
+    """
     peer = 0
     for field_number, wire_type, value in _iter_wire_fields(serial_config.SerializeToString()):
-        if field_number == PEER_NODE_FIELD and wire_type == 0 and value is not None:
+        if field_number == LEGACY_PEER_NODE_FIELD and wire_type == 0 and value is not None:
             peer = value
     return peer
 
 
 def configure_serial(
     serial_config,
-    peer_node: int = 0,
+    peer_node: Optional[int] = None,
     *,
     enabled: bool = True,
     rxd: Optional[int] = None,
     txd: Optional[int] = None,
     baud: Optional[int] = None,
 ) -> None:
-    """Set MAVLink mode and its fixed peer on a SerialConfig message.
+    """Enable frame-aware MAVLink mesh mode on a SerialConfig message.
 
-    A peer of zero preserves firmware discovery mode, where the first non-empty
-    SERIAL_APP sender becomes the peer until reboot.
+    peer_node is accepted only for source compatibility. It is not written and
+    has no routing effect in current firmware.
     """
-    if not 0 <= peer_node <= 0xFFFFFFFF:
-        raise ValueError("peer_node must fit in uint32")
+    if peer_node is not None:
+        if not 0 <= peer_node <= 0xFFFFFFFF:
+            raise ValueError("peer_node must fit in uint32")
+        if peer_node != 0:
+            warnings.warn("peer_node is deprecated and ignored by MAVLink mesh mode", DeprecationWarning, stacklevel=2)
 
     serial_config.enabled = enabled
     if rxd is not None:
@@ -115,13 +126,7 @@ def configure_serial(
         except ValueError as exc:
             raise ValueError(f"unsupported serial baud {baud}") from exc
 
-    # Field 7 is known to older bindings but value 11 is new. Proto3 enum fields are
-    # open, so parsing the canonical value sets it even when the local name table lags.
     _merge_varint_field(serial_config, MODE_FIELD, MAVLINK_SERIAL_MODE)
-
-    # Field 9 is unknown to the old generated class and is therefore retained in the
-    # message's unknown-field set. CopyFrom and serialization preserve it end to end.
-    _merge_varint_field(serial_config, PEER_NODE_FIELD, peer_node)
 
 
 def _parse_int(value: str) -> int:
@@ -129,11 +134,11 @@ def _parse_int(value: str) -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Configure Meshtastic MAVLink serial bridge")
+    parser = argparse.ArgumentParser(description="Configure Meshtastic MAVLink mesh mode")
     transport = parser.add_mutually_exclusive_group()
     transport.add_argument("--port", help="Meshtastic serial device, for example /dev/ttyACM0")
     transport.add_argument("--host", help="Meshtastic TCP hostname or address")
-    parser.add_argument("--peer", type=_parse_int, default=0, help="fixed node number, or 0 for first-sender discovery")
+    parser.add_argument("--peer", type=_parse_int, help="deprecated compatibility option; ignored")
     parser.add_argument("--rxd", type=int, help="serial RX GPIO")
     parser.add_argument("--txd", type=int, help="serial TX GPIO")
     parser.add_argument("--baud", type=int, help="serial baud, for example 57600 or 115200")
@@ -159,7 +164,9 @@ def main() -> None:
         )
         node.writeConfig("serial")
         time.sleep(0.5)
-        print(f"Set serial.mode=MAVLINK and serial.peer_node=0x{args.peer:08x}")
+        print("Set serial.mode=MAVLINK mesh mode")
+        if args.peer is not None:
+            print("Note: --peer is deprecated and was ignored")
     finally:
         interface.close()
 
